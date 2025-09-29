@@ -1,0 +1,186 @@
+##
+# Descripción: Playbook de Ansible para crear un cluster de rke2
+# Autor: Xabier Gabiña Barañano
+# Fecha: 2025-03-13
+# Versión: 2.0
+# Licencia: GPL-3.0
+##
+- name: Preconfigurar los nodos del cluster
+  hosts: all
+  become: yes
+  tags: preconfig
+  vars:
+    dependencias:
+      - gawk
+  tasks:        
+    - name: Configurar el hostname
+      block:
+        - name: Crear el archivo /etc/hostname
+          hostname:
+            name: "{{ inventory_hostname }}"
+        # Configurar el /etc/hosts
+        - name: Generar entradas de hosts para todos los nodos
+          set_fact:
+            hosts_entries: |
+              127.0.0.1 localhost localhost.localdomain localhost4 localhost4.localdomain4
+              ::1 localhost localhost.localdomain localhost6 localhost6.localdomain6
+
+              {% for host in groups['all'] %}
+              {{ hostvars[host]['ansible_host'] }} {{ host }}
+              {% endfor %}
+        - name: Actualizar el archivo /etc/hosts con las entradas completas
+          copy:
+            dest: /etc/hosts
+            content: "{{ hosts_entries }}"
+            owner: root
+            group: root
+            mode: '0644'
+    - name: Configurar NetworkManager
+      block:
+        - name: Crear el archivo de configuración de NetworkManager
+          copy:
+            dest: /etc/NetworkManager/conf.d/rke2-canal.conf
+            content: |
+              [keyfile]
+              unmanaged-devices=interface-name:flannel*;interface-name:cali*;interface-name:tunl*;interface-name:vxlan.calico;interface-name:vxlan-v6.calico;interface-name:wireguard.cali;interface-name:wg-v6.cali
+        - name: Reiniciar NetworkManager
+          service:
+            name: NetworkManager
+            state: restarted
+    - name: Desactivar el swap
+      shell: |
+        swapoff -a
+        sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+    - name: Activar el IPv4 forwarding
+      shell: |
+        cat <<EOF | tee /etc/sysctl.d/k8s.conf
+        net.ipv4.ip_forward = 1
+        EOF
+        sysctl --system
+    - name: Activar módulos necesarios en el kernel
+      block:
+        - name: Activar el módulo dm_crypt en el kernel
+          modprobe:
+            name: dm_crypt
+            state: present
+        - name: Activar el módulo br_netfilter en el kernel
+          modprobe:
+            name: br_netfilter
+            state: present
+        - name: Asegurar que los módulos se carguen al reiniciar
+          copy:
+            dest: /etc/modules-load.d/k8s.conf
+            content: |
+              dm_crypt
+              br_netfilter
+    - name: Configurar dependencias
+      block:
+        - name: Instalar dependencias
+          package:
+            name: "{{ item }}"
+            state: present
+          with_items: "{{ dependencias }}"
+        - name: Instalar el paquete iscsi-initiator-utils
+          yum:
+            name: iscsi-initiator-utils
+            state: present
+            disable_gpg_check: yes
+
+        - name: Verificar la ubicación del comando iscsi-iname
+          command: which iscsi-iname
+          register: iscsi_iname_path
+
+        - name: Crear el directorio /etc/iscsi si no existe
+          file:
+            path: /etc/iscsi
+            state: directory
+            mode: '0755'
+
+        - name: Configurar el archivo initiatorname.iscsi
+          copy:
+            dest: /etc/iscsi/initiatorname.iscsi
+            content: "InitiatorName={{ iscsi_iname_path.stdout }}"
+          when: iscsi_iname_path.stdout != ""
+
+        - name: Habilitar el servicio iscsid
+          systemd:
+            name: iscsid
+            enabled: yes
+
+        - name: Iniciar el servicio iscsid
+          systemd:
+            name: iscsid
+            state: started
+    - name: Descargar el script de instalación de RKE2
+      block:
+        - name: Descargar el script de instalación de RKE2
+          shell: curl -sfL https://get.rke2.io --output /tmp/install.sh
+        - name: Hacemos el script de instalación ejecutable
+          shell: chmod +x /tmp/install.sh
+- name: Configurar el nodo maestro
+  hosts: master
+  become: yes
+  tags: config-master
+  tasks:
+    - name: Instalar RKE2
+      block:
+        - name: Instalar RKE2
+          shell: INSTALL_RKE2_VERSION="{{ rke2_version }}" /tmp/install.sh
+        - name: Creamos el archivo de configuración de RKE2
+          copy:
+            dest: /etc/rancher/rke2/config.yaml
+            content: |
+              token: "{{ token }}"
+              tls-san:
+                - "{{ rke2_load_balancer }}"
+        - name: Habilitamos y arrancamos el servicio de RKE2
+          service:
+            name: rke2-server
+            state: started
+            enabled: yes
+- name: Configurar los nodos de plano de control
+  hosts: control-planes
+  become: yes
+  tags: config-control-plane
+  tasks:
+    - name: Instalar RKE2
+      block:
+        - name: Instalar RKE2
+          shell: INSTALL_RKE2_VERSION="{{ rke2_version }}" INSTALL_RKE2_TYPE="server" /tmp/install.sh
+        - name: Configuramos el archivo de configuración de RKE2
+          copy:
+            dest: /etc/rancher/rke2/config.yaml
+            content: |
+              server: "https://{{ rke2_load_balancer }}:9345"
+              token: "{{ token }}"
+              tls-san:
+                - "{{ rke2_load_balancer }}"
+        - name: Habilitamos y arrancamos el servicio de RKE2
+          service:
+            name: rke2-server
+            state: started
+            enabled: yes
+- name: Configurar los nodos de trabajo
+  hosts: workers
+  become: yes
+  tags: config-worker
+  tasks:
+    - name: Instalar RKE2
+      block:
+        - name: Instalar RKE2
+          shell: INSTALL_RKE2_VERSION="{{ rke2_version }}" INSTALL_RKE2_TYPE="agent" /tmp/install.sh
+        - name: Configuramos el archivo de configuración de RKE2
+          copy:
+            dest: /etc/rancher/rke2/config.yaml
+            content: |
+              server: "https://{{ rke2_load_balancer }}:9345"
+              token: "{{ token }}"
+              tls-san:
+                - "{{ rke2_load_balancer }}"
+              node-label:
+                - "node.longhorn.io/create-default-disk=false"
+        - name: Habilitamos y arrancamos el servicio de RKE2
+          service:
+            name: rke2-agent
+            state: started
+            enabled: yes
